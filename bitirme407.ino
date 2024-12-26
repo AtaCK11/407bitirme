@@ -1,19 +1,37 @@
 #define ECG_BUFFER_SIZE 256  // Buffer size for ECG
 #define HR_BUFFER_SIZE 5     // Buffer size for heart rate
 
-#define QUEUE_SIZE 10        // Queue size of our RTOS
+#define QUEUE_SIZE 16        // Queue size of our RTOS
 
 // Sample rates
 #define ECG_SAMPLE_RATE 1
 #define HR_SAMPLE_RATE 1
 #define HR_PUSH_SAMPLE_RATE 2000
-#define AIRQ_SAMPLE_RATE 10000
+#define MQ135_SAMPLE_RATE 8000
 #define TEMP_SAMPLE_RATE 5000
+#define ROOM_SAMPLE_RATE 5000
+
+
+// Calibration samples
+#define MQ135_CALIBRATION_SAMPLES 20
+#define MQ135_CALIBRATION_DELAY 200 // ms between samples
+
+// Sensor Pins
+#define MQ135_PIN 35
+#define DS18B20_PIN 33
+#define DHT11_PIN 32
+
+// Defaults
+#define RatioMQ135CleanAir 3.6
 
 #define CUTOFF_FREQUENCY 0.5
 
 #include <Wire.h>
-#include "MAX30100_PulseOximeter.h"
+#include <MAX30100_PulseOximeter.h>
+#include <MQUnifiedsensor.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <DHT.h>
 
 enum SensorType {
   ECG,
@@ -104,6 +122,13 @@ struct SensorData {
 
 // sensors
 PulseOximeter pox;
+MQUnifiedsensor MQ135("ESP32", 5, 12, MQ135_PIN, "MQ-135");
+
+OneWire oneWire(DS18B20_PIN);
+DallasTemperature sensors(&oneWire);
+
+DHT dht(DHT11_PIN, DHT11);
+
 
 void setup() {
   Serial.begin(115200);
@@ -120,21 +145,57 @@ void setup() {
   ecgBuffer.init(SensorType::ECG);
   hrBuffer.init(SensorType::HR);
 
-  if (!pox.begin()) {
-    Serial.println("FAILED");
-    for(;;);
+  // Initialize sensors
+  // HR
+  if (!pox.begin()) 
+  {
+    for (int i = 0; i < 10; i++) 
+    {
+      Serial.println("MAX30100 ---> FAILED");
+      Serial.println("MAX30100 ---> FAILED");
+    }
   }
   pox.setIRLedCurrent(MAX30100_LED_CURR_7_6MA);
   delay(100);
 
+  // MQ135
+  MQ135.setRegressionMethod(1);
+  MQ135.init();
+  Serial.print("Calibrating, please wait...");
+  float r0Values[MQ135_CALIBRATION_SAMPLES];
+  for (int i = 0; i < MQ135_CALIBRATION_SAMPLES; i++) 
+  {
+    MQ135.update();
+    r0Values[i] = MQ135.calibrate(RatioMQ135CleanAir);
+    delay(MQ135_CALIBRATION_DELAY);
+  }
+
+  // median R0 value
+  std::sort(r0Values, r0Values + MQ135_CALIBRATION_SAMPLES);
+  float medianR0 = r0Values[MQ135_CALIBRATION_SAMPLES / 2];
+  MQ135.setR0(medianR0);
+  Serial.print("Calibration done. R0 = ");
+  Serial.println(medianR0);
+
+  if(isinf(medianR0)) {Serial.println("Warning: Conection issue, R0 is infinite (Open circuit detected) please check your wiring and supply"); while(1);}
+  if(medianR0 == 0){Serial.println("Warning: Conection issue found, R0 is zero (Analog pin shorts to ground) please check your wiring and supply"); while(1);}
+
+  // DS18B20
+  sensors.begin();
+
+  // DHT11
+  dht.begin();
+
+  // sensor init end
   // setup low pass filter for heart rate data push function
   setupButterworthFilter(HR_PUSH_SAMPLE_RATE, CUTOFF_FREQUENCY);
 
   // Create RTOS tasks
-  xTaskCreate(ecgTask, "ECG Task", 2048, NULL, 2, NULL);
+  xTaskCreate(ecgTask, "ECG Task", 2048, NULL, 3, NULL);
   xTaskCreate(hrTask, "HR Task", 4096, NULL, 3, NULL);
   xTaskCreate(hrPushTask, "HR Push Task", 2048, NULL, 2, NULL);
-  xTaskCreate(temperatureTask, "Temperature Task", 2048, NULL, 1, NULL);
+  xTaskCreate(bodyTemperatureTask, "Body Temperature Task", 2048, NULL, 1, NULL);
+  xTaskCreate(roomTempNHumTask, "Room Temperature n Humidity Task", 2048, NULL, 1, NULL);
   xTaskCreate(airQualityTask, "Air Quality Task", 2048, NULL, 1, NULL);
   xTaskCreate(processTask, "Process Task", 2048, NULL, 1, NULL);
   xTaskCreate(debugPrintTask, "Debug Task", 2048, NULL, 1, NULL);
@@ -167,20 +228,65 @@ void hrPushTask(void *parameter) {
   }
 }
 
-void temperatureTask(void *parameter) {
+void roomTempNHumTask(void *parameter) {
   while (true) {
-    SensorData tempData = {"Temperature", random(36, 38)};
+
+    // reading the values generates an average 210ms delay, might change to other DHT sensors
+    SensorData tempData = {"<Room>|Humidity|", dht.readHumidity()};
+    xQueueSend(sensorQueue, &tempData, portMAX_DELAY);
+
+    tempData = {"<Room>|Temperature|", dht.readTemperature()};
+    xQueueSend(sensorQueue, &tempData, portMAX_DELAY);
+
+    vTaskDelay(pdMS_TO_TICKS(ROOM_SAMPLE_RATE)); // sample rate delay
+  }
+}
+
+void bodyTemperatureTask(void *parameter) {
+  while (true) {
+    sensors.requestTemperatures();
+    SensorData tempData = {"<Body>|Temperature|", sensors.getTempCByIndex(0)};
     xQueueSend(sensorQueue, &tempData, portMAX_DELAY);
     vTaskDelay(pdMS_TO_TICKS(TEMP_SAMPLE_RATE)); // sample rate delay
   }
 }
 
 void airQualityTask(void *parameter) {
-    while (true) {
-      SensorData airQualityData = {"Air Quality", random(0, 500)};
-      xQueueSend(sensorQueue, &airQualityData, portMAX_DELAY);
-      vTaskDelay(pdMS_TO_TICKS(AIRQ_SAMPLE_RATE)); // sample rate delay
-    }
+  while (true) {
+    MQ135.update();
+
+    // CO
+    MQ135.setA(605.18); MQ135.setB(-3.937);
+    SensorData airQualityData = {"<Room>|CO|", MQ135.readSensor()};
+    xQueueSend(sensorQueue, &airQualityData, portMAX_DELAY);
+
+    // Alcohol
+    MQ135.setA(77.255); MQ135.setB(-3.18);
+    airQualityData = {"<Room>|Alcohol|", MQ135.readSensor()};
+    xQueueSend(sensorQueue, &airQualityData, portMAX_DELAY);
+
+    // CO2
+    MQ135.setA(110.47); MQ135.setB(-2.862);
+    airQualityData = {"<Room>|CO2|", MQ135.readSensor()};
+    xQueueSend(sensorQueue, &airQualityData, portMAX_DELAY);
+
+    // Toluene
+    MQ135.setA(44.947); MQ135.setB(-3.445);
+    airQualityData = {"<Room>|Toluene|", MQ135.readSensor()};
+    xQueueSend(sensorQueue, &airQualityData, portMAX_DELAY);
+
+    // NH4
+    MQ135.setA(102.2); MQ135.setB(-2.473);
+    airQualityData = {"<Room>|NH4|", MQ135.readSensor()};
+    xQueueSend(sensorQueue, &airQualityData, portMAX_DELAY);
+
+    // Acetone
+    MQ135.setA(34.668); MQ135.setB(-3.369);
+    airQualityData = {"<Room>|Acetone|", MQ135.readSensor()};
+    xQueueSend(sensorQueue, &airQualityData, portMAX_DELAY);
+
+    vTaskDelay(pdMS_TO_TICKS(MQ135_SAMPLE_RATE)); // sample rate delay
+  }
 }
 
 void processTask(void *parameter) {
