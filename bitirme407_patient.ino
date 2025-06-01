@@ -3,6 +3,9 @@
 #include <esp_now.h>
 #include <WiFi.h>
 
+#include <HTTPClient.h>
+//#include <ESPAsyncWebServer.h>
+
 #include <Wire.h>
 #include <MAX30100_PulseOximeter.h>
 #include <MQUnifiedsensor.h>
@@ -10,14 +13,14 @@
 #include <DallasTemperature.h>
 #include <DHT.h>
 
-#define ECG_BUFFER_SIZE 256  // Buffer size for ECG
+#define ECG_BUFFER_SIZE 1024  // Buffer size for ECG
 #define HR_BUFFER_SIZE 5     // Buffer size for heart rate
 
-#define QUEUE_SIZE 16        // Queue size of our RTOS
+#define QUEUE_SIZE 128        // Queue size of our RTOS
 
 // Sample rates
 #define ECG_SAMPLE_RATE 1
-#define ECG_DATA_TX_RATE 200
+#define ECG_DATA_TX_RATE 1000
 #define HR_SAMPLE_RATE 1
 #define HR_PUSH_SAMPLE_RATE 500
 #define MQ135_SAMPLE_RATE 8000
@@ -26,7 +29,7 @@
 
 
 // Calibration samples
-#define MQ135_CALIBRATION_SAMPLES 20
+#define MQ135_CALIBRATION_SAMPLES 10
 #define MQ135_CALIBRATION_DELAY 200 // ms between samples
 
 // Sensor Pins
@@ -56,10 +59,13 @@
   #define debugPrintfHex(x)
 #endif
 
+// http://192.168.4.1/register
+
 enum SensorType {
   ECG,
   HR
 };
+
 
 float previousOutput = 0.0;  // feedback filtered value
 float alpha = 0.0;  // filter coefficient
@@ -139,15 +145,37 @@ QueueHandle_t sensorQueue;
 
 // SensorData structure
 struct SensorData {
-  char sensorType[36];
-  float value;
+  int sensorTag;
+  float sensorValue;
+};
+
+
+enum SensorTag {
+  BODY_ECG = 1,
+  BODY_HR = 2,
+  BODY_BO2 = 3,
+  ROOM_TEMP = 4,
+  ROOM_HUM = 5,
+  BODY_TEMP = 6,
+  ROOM_CO = 7,
+  ROOM_ALCOHOL = 8,
+  ROOM_CO2 = 9,
+  ROOM_TOLUENE = 10,
+  ROOM_NH4 = 11,
+  ROOM_ACETONE = 12,
 };
 
 // esp receiver
-uint8_t receiverMACAddress[] = {0xA0, 0xB7, 0x65, 0x28, 0xCE, 0xA0};
+//uint8_t myMACAddress[8];
 
-static const char* PMK_KEY_STR = "U@Kw%nV&PzbRK2WM";
-static const char* LMK_KEY_STR = "Ruth:WqH9@j%h5qg";
+
+// server properties
+const char* server_ssid = "BITIRME_AP_SERVER";
+const char* server_password = "12345678";
+
+// server IP
+char pc_db_ip[32] = "";
+const char* server_url = "http://192.168.4.2";
 
 // sensors
 PulseOximeter pox;
@@ -158,6 +186,8 @@ DallasTemperature sensors(&oneWire);
 
 DHT dht(DHT11_PIN, DHT11);
 
+bool wifi_connection = false;
+
 
 void setRGBColor(int red, int green, int blue)
 {
@@ -167,15 +197,86 @@ void setRGBColor(int red, int green, int blue)
   analogWrite(RGB_B_PIN, blue);
 }
 
-void onPacketSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  debugPrint("\nLast Packet:\t");
-  debugPrintln(status == ESP_NOW_SEND_SUCCESS ? "Sent" : "Fail");
+bool register_with_server() {
+  WiFiClient client;
+  HTTPClient http;
+
+  // Debugging to check pc_db_ip
+  if (strlen(pc_db_ip) == 0) {
+    Serial.println("Error: PC DB IP is empty!");
+    return false;
+  }
+
+  char url[64];
+  snprintf(url, sizeof(url), "http://%s:5000/register", pc_db_ip);
+  
+  // Debugging to ensure the URL is correct
+  Serial.print("Connecting to URL: ");
+  Serial.println(url);
+  
+  String payload = "{\"mac\":\"" + WiFi.macAddress() + "\",\"ip\":\"" + WiFi.localIP().toString() + "\"}";
+  http.begin(client, url);
+  http.addHeader("Content-Type", "application/json");
+  
+  int httpCode = http.POST(payload);
+  http.end();
+
+  // Check HTTP response code
+  if (httpCode == HTTP_CODE_OK) {
+    Serial.println("Device registered successfully.");
+    return true;
+  } else {
+    Serial.print("Device registration failed. HTTP code: ");
+    Serial.println(httpCode);
+    return false;
+  }
 }
+
+
+
+bool get_pc_ip_from_ap() {
+  WiFiClient client;
+  HTTPClient http;
+
+  http.begin(client, "http://192.168.4.1/get_pc_ip");  // ESP32 AP IP
+  int httpCode = http.GET();
+
+  if (httpCode == HTTP_CODE_OK) {
+    String response = http.getString();
+    response.trim();
+    response.toCharArray(pc_db_ip, sizeof(pc_db_ip));  // Copy to global buffer
+    Serial.print("Received PC IP: ");
+    Serial.println(pc_db_ip);
+    http.end();
+    return true;
+  } else {
+    Serial.print("Failed to get PC IP. HTTP code: ");
+    Serial.println(httpCode);
+    http.end();
+    return false;
+  }
+}
+
+
 
 void setup() {
   Serial.begin(115200);
 
-  WiFi.mode(WIFI_STA);
+    // Connect to Wi-Fi
+  WiFi.begin(server_ssid, server_password);
+  #ifdef DEBUG
+  #else
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.println("Connecting to WiFi...");
+  }
+  Serial.println("Connected to Wi-Fi");
+  wifi_connection = true;
+  #endif
+
+  Serial.print("IP: "); Serial.println(WiFi.localIP());
+  Serial.print("MAC: "); Serial.println(WiFi.macAddress());
+  //myMACAddress = WiFi.macAddress();
 
   delay(500);
 
@@ -184,35 +285,25 @@ void setup() {
   pinMode(RGB_B_PIN, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
 
-  // Print the device's MAC address
-  debugPrint("Sender MAC Address: ");
-  debugPrintln(WiFi.macAddress());
+  delay(1000);
 
-  // Initialize ESP-NOW
-  if (esp_now_init() != ESP_OK) {
-    debugPrintln("Error initializing ESP-NOW");
-    setRGBColor(0, 255, 255); // RED
-    while (true);
+  #ifdef DEBUG
+  #else
+  while (!get_pc_ip_from_ap()) {
+    Serial.println("Retrying in 3 seconds...");
+    delay(3000);
   }
 
   delay(1000);
-  // ESP NOW
-  //esp_now_register_recv_cb(OnDataRecv);
-  esp_now_set_pmk((uint8_t *)PMK_KEY_STR);
 
-  esp_now_peer_info_t peerInfo;
-  memcpy(peerInfo.peer_addr, receiverMACAddress, 6);
-  peerInfo.encrypt = true;
-  for (uint8_t i = 0; i < 16; i++) {
-    peerInfo.lmk[i] = LMK_KEY_STR[i];
-  }
-  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-    debugPrintln("Failed to add peer");
-    setRGBColor(0, 255, 255); // RED
-    while (true);
+  while (!register_with_server()) {
+    Serial.println("Retrying in 3 seconds...");
+    delay(3000);
   }
 
-  esp_now_register_send_cb(onPacketSent);
+  #endif
+
+  delay(1000);
 
   // RTOS queue
   sensorQueue = xQueueCreate(QUEUE_SIZE, sizeof(SensorData));
@@ -237,7 +328,7 @@ void setup() {
       debugPrintln("MAX30100 ---> FAILED");
     }
     setRGBColor(0, 255, 255); // RED
-    while (true);
+    //while (true);
   }
   pox.setIRLedCurrent(MAX30100_LED_CURR_7_6MA);
   delay(100);
@@ -246,29 +337,30 @@ void setup() {
   MQ135.setRegressionMethod(1);
   MQ135.init();
   debugPrint("Calibrating, please wait...");
-  float r0Values[MQ135_CALIBRATION_SAMPLES];
-  for (int i = 0; i < MQ135_CALIBRATION_SAMPLES; i++) 
+  float calcR0 = 0;
+  for(int i = 1; i<=10; i ++)
   {
-    MQ135.update();
-    r0Values[i] = MQ135.calibrate(RatioMQ135CleanAir);
-    delay(MQ135_CALIBRATION_DELAY);
+    MQ135.update(); // Update data, the arduino will read the voltage from the analog pin
+    calcR0 += MQ135.calibrate(RatioMQ135CleanAir);
+    Serial.print(".");
   }
+  MQ135.setR0(calcR0/10);
 
   // median R0 value
-  std::sort(r0Values, r0Values + MQ135_CALIBRATION_SAMPLES);
-  float medianR0 = r0Values[MQ135_CALIBRATION_SAMPLES / 2];
-  MQ135.setR0(medianR0);
+  //std::sort(r0Values, r0Values + MQ135_CALIBRATION_SAMPLES);
+  //float medianR0 = r0Values[MQ135_CALIBRATION_SAMPLES / 2];
+  //MQ135.setR0(medianR0);
   debugPrint("Calibration done. R0 = ");
-  debugPrintln(medianR0);
+  debugPrintln(calcR0/10);
 
-  if(isinf(medianR0)) 
+  if(isinf(calcR0)) 
   {
     setRGBColor(0, 255, 255); // RED
-    debugPrintln("Warning: Conection issue, R0 is infinite (Open circuit detected) please check your wiring and supply"); while(1);
+    debugPrintln("Warning: Conection issue, R0 is infinite (Open circuit detected) please check your wiring and supply"); //while(1);
   }
-  if(medianR0 == 0){
+  if(calcR0 == 0){
     setRGBColor(0, 255, 255); // RED
-    debugPrintln("Warning: Conection issue found, R0 is zero (Analog pin shorts to ground) please check your wiring and supply"); while(1);
+    debugPrintln("Warning: Conection issue found, R0 is zero (Analog pin shorts to ground) please check your wiring and supply"); //while(1);
   }
 
   // DS18B20
@@ -281,15 +373,17 @@ void setup() {
   // setup low pass filter for heart rate data push function
   setupButterworthFilter(HR_PUSH_SAMPLE_RATE, CUTOFF_FREQUENCY);
 
+  setRGBColor(255, 0, 255); // GREEN
+
   // Create RTOS tasks
   xTaskCreate(ecgTask, "ECG Task", 2048, NULL, 3, NULL);
   xTaskCreate(hrTask, "HR Task", 4096, NULL, 3, NULL);
   xTaskCreate(hrPushTask, "HR Push Task", 2048, NULL, 2, NULL);
-  //xTaskCreate(sendECGTask, "Send ECG Data Task", 2048, NULL, 2, NULL);
+  xTaskCreate(sendECGTask, "Send ECG Data Task", 2048, NULL, 2, NULL);
   xTaskCreate(bodyTemperatureTask, "Body Temperature Task", 2048, NULL, 1, NULL);
   xTaskCreate(roomTempNHumTask, "Room Temperature n Humidity Task", 2048, NULL, 1, NULL);
   xTaskCreate(airQualityTask, "Air Quality Task", 2048, NULL, 1, NULL);
-  xTaskCreate(processTask, "Process Task", 2048, NULL, 1, NULL);
+  xTaskCreate(processTask, "Process Task", 4096, NULL, 1, NULL);
   //xTaskCreate(debugPrintTask, "Debug Task", 2048, NULL, 1, NULL);
 }
 
@@ -311,10 +405,10 @@ void hrTask(void *parameter) {
 void hrPushTask(void *parameter) {
   while (true) {
     float smoothedHeartRate = butterworthFilter(pox.getHeartRate());
-    Serial.print("Filtered Heart Rate: ");
-    Serial.println(smoothedHeartRate); Serial.println();
-    Serial.print("Normal Heart Rate: ");
-    Serial.println(pox.getHeartRate());
+    //Serial.print("Filtered Heart Rate: ");
+    //Serial.println(smoothedHeartRate); Serial.println();
+    //Serial.print("Normal Heart Rate: ");
+    //Serial.println(pox.getHeartRate());
 
     hrBuffer.push(smoothedHeartRate);
 
@@ -323,14 +417,7 @@ void hrPushTask(void *parameter) {
       digitalWrite(BUZZER_PIN, HIGH);
     } else { digitalWrite(BUZZER_PIN, LOW); }
 
-    SensorData hrSensorData = {"<HR>|SmoothedHeartRate|", smoothedHeartRate};
-    esp_err_t result = esp_now_send(receiverMACAddress, (uint8_t *)&hrSensorData, sizeof(hrSensorData));
-    if (result == ESP_OK) {
-      debugPrint("Sent Smoothed Heart Rate: ");
-      debugPrintln(smoothedHeartRate);
-    } else {
-      debugPrintln("Error sending smoothed heart rate data");
-    }
+    SensorData hrSensorData = {SensorTag::BODY_HR, smoothedHeartRate};
 
     vTaskDelay(pdMS_TO_TICKS(HR_PUSH_SAMPLE_RATE)); // sample rate delay
   }
@@ -340,12 +427,15 @@ void roomTempNHumTask(void *parameter) {
   while (true) {
 
     // reading the values generates an average 210ms delay, might change to other DHT sensors
-    SensorData tempData = {"<Room>|Humidity|", dht.readHumidity()};
+    SensorData tempData = {SensorTag::ROOM_HUM, dht.readHumidity()};
     xQueueSend(sensorQueue, &tempData, portMAX_DELAY);
 
-    tempData = {"<Room>|Temperature|", dht.readTemperature()};
+    tempData = {SensorTag::ROOM_TEMP, dht.readTemperature()};
     xQueueSend(sensorQueue, &tempData, portMAX_DELAY);
 
+    Serial.println("TEMP -- HUM");
+    Serial.println(dht.readTemperature());
+    Serial.println(dht.readHumidity());
     vTaskDelay(pdMS_TO_TICKS(ROOM_SAMPLE_RATE)); // sample rate delay
   }
 }
@@ -354,12 +444,12 @@ void bodyTemperatureTask(void *parameter) {
   while (true) {
     sensors.requestTemperatures();
     float cTemp = sensors.getTempCByIndex(0);
-    SensorData tempData = {"<Body>|Temperature|", cTemp};
+    SensorData tempData = {SensorTag::BODY_TEMP, cTemp};
 
     if (cTemp > 39 || cTemp < 32)
     {
       setRGBColor(0, 255, 0); // MAGENTA
-    } else { setRGBColor(255, 0, 255); }
+    } else { setRGBColor(255, 0, 255); } // GREEN
 
     xQueueSend(sensorQueue, &tempData, portMAX_DELAY);
     vTaskDelay(pdMS_TO_TICKS(TEMP_SAMPLE_RATE)); // sample rate delay
@@ -372,32 +462,32 @@ void airQualityTask(void *parameter) {
 
     // CO
     MQ135.setA(605.18); MQ135.setB(-3.937);
-    SensorData airQualityData = {"<Room>|CO|", MQ135.readSensor()};
+    SensorData airQualityData = {SensorTag::ROOM_CO, MQ135.readSensor()};
     xQueueSend(sensorQueue, &airQualityData, portMAX_DELAY);
 
     // Alcohol
     MQ135.setA(77.255); MQ135.setB(-3.18);
-    airQualityData = {"<Room>|Alcohol|", MQ135.readSensor()};
+    airQualityData = {SensorTag::ROOM_ALCOHOL, MQ135.readSensor()};
     xQueueSend(sensorQueue, &airQualityData, portMAX_DELAY);
 
     // CO2
     MQ135.setA(110.47); MQ135.setB(-2.862);
-    airQualityData = {"<Room>|CO2|", MQ135.readSensor()};
+    airQualityData = {SensorTag::ROOM_CO2, MQ135.readSensor()+400};
     xQueueSend(sensorQueue, &airQualityData, portMAX_DELAY);
 
     // Toluene
     MQ135.setA(44.947); MQ135.setB(-3.445);
-    airQualityData = {"<Room>|Toluene|", MQ135.readSensor()};
+    airQualityData = {SensorTag::ROOM_TOLUENE, MQ135.readSensor()};
     xQueueSend(sensorQueue, &airQualityData, portMAX_DELAY);
 
     // NH4
     MQ135.setA(102.2); MQ135.setB(-2.473);
-    airQualityData = {"<Room>|NH4|", MQ135.readSensor()};
+    airQualityData = {SensorTag::ROOM_NH4, MQ135.readSensor()};
     xQueueSend(sensorQueue, &airQualityData, portMAX_DELAY);
 
     // Acetone
     MQ135.setA(34.668); MQ135.setB(-3.369);
-    airQualityData = {"<Room>|Acetone|", MQ135.readSensor()};
+    airQualityData = {SensorTag::ROOM_ACETONE, MQ135.readSensor()};
     xQueueSend(sensorQueue, &airQualityData, portMAX_DELAY);
 
     vTaskDelay(pdMS_TO_TICKS(MQ135_SAMPLE_RATE)); // sample rate delay
@@ -407,41 +497,100 @@ void airQualityTask(void *parameter) {
 void processTask(void *parameter) {
   SensorData receivedData;
   while (true) {
-    if (xQueueReceive(sensorQueue, &receivedData, portMAX_DELAY)) { // if theres data in our queue
-      esp_err_t result = esp_now_send(receiverMACAddress, (uint8_t *)&receivedData, sizeof(SensorData));
-      if (result == ESP_OK) {
-        debugPrint("Sent: ");
-        debugPrint(receivedData.sensorType);
-        debugPrint(": ");
-        debugPrintln(receivedData.value);
-      } else {
-        debugPrintln("Error sending "); debugPrint(receivedData.sensorType);
+    if (xQueueReceive(sensorQueue, &receivedData, portMAX_DELAY)) {
+      float value = receivedData.sensorValue;
+
+      // Check memory and value sanity before processing
+      if (isnan(value) || isinf(value)) {
+        //Serial.printf("[SKIPPED] Invalid sensor value (NaN/Inf). Tag: %d\n", receivedData.sensorTag);
+        continue;
       }
+
+      if (value < 0 && receivedData.sensorTag != SensorTag::BODY_ECG) {
+        //Serial.printf("[SKIPPED] Negative value. Tag: %d Value: %.2f\n", receivedData.sensorTag, value);
+        continue;
+      }
+
+      // Send from a SERIAL
+
+      Serial.printf("[SENSOR_DATA] -> %d | %.6f\n", receivedData.sensorTag, value);
+
+      //Serial.printf("[DEBUG] Preparing to send -> Tag: %d, Value: %.6f\n", receivedData.sensorTag, value);
+
+      // Create JSON manually, not using String concatenation
+      char payload[128];
+      snprintf(payload, sizeof(payload),
+               "{\"sensorTag\":%d,\"sensorValue\":%.6f}",
+               receivedData.sensorTag, value);
+
+      if (wifi_connection) {
+        WiFiClient client;
+        HTTPClient http;
+        char url[64];
+        snprintf(url, sizeof(url), "http://%s:5000/sensor_data", pc_db_ip);
+
+        http.begin(client, url);
+        http.addHeader("Content-Type", "application/json");
+
+        int httpCode = http.POST((uint8_t *)payload, strlen(payload));
+        String response = http.getString();
+
+        if (httpCode == HTTP_CODE_OK) {
+          Serial.printf("[SUCCESS] Sent Tag: %d, Value: %.2f\n", receivedData.sensorTag, value);
+        } else {
+          Serial.printf("[FAIL] Code: %d | Response: %s\n", httpCode, response.c_str());
+        }
+
+        http.end();
+      }
+
+    } else {
+      vTaskDelay(10 / portTICK_PERIOD_MS);
     }
   }
 }
+
 
 void sendECGTask(void *parameter) {
   while (true) {
     if (ecgBuffer.count == ECG_BUFFER_SIZE) {
-      for (int i = 0; i < ECG_BUFFER_SIZE; i++) {
-        float value = ecgBuffer.pop();
-        SensorData ecgSensorData = {"<ECG>|Data Batch|", value};
+      if (wifi_connection) {
+        WiFiClient client;
+        HTTPClient http;
 
-        esp_err_t result = esp_now_send(receiverMACAddress, (uint8_t *)&ecgSensorData, sizeof(SensorData));
-        if (result == ESP_OK) {
-          debugPrint("Sent ECG Data: ");
-          debugPrintln(value);
-        } else {
-          debugPrintln("Error sending ECG data");
+        char url[64];
+        snprintf(url, sizeof(url), "http://%s:5000/ecg_data", pc_db_ip);
+
+        String jsonPayload = "{\"ecg_values\":[";
+
+        for (int i = 0; i < ECG_BUFFER_SIZE; i++) {
+          float value = ecgBuffer.pop();
+          jsonPayload += String(value, 4);
+          if (i < ECG_BUFFER_SIZE - 1) {
+            jsonPayload += ",";
+          }
         }
-      }
-    }
 
+        jsonPayload += "]}";
+
+        http.begin(client, url);
+        http.addHeader("Content-Type", "application/json");
+
+        int httpCode = http.POST(jsonPayload);
+        String response = http.getString();
+
+        if (httpCode == HTTP_CODE_OK) {
+          Serial.println("[SUCCESS] ECG data sent.");
+        } else {
+          Serial.printf("[FAIL] Code: %d | Response: %s\n", httpCode, response.c_str());
+        }
+
+        http.end();
+      } 
+    }
     vTaskDelay(pdMS_TO_TICKS(ECG_DATA_TX_RATE));
   }
 }
-
 
 void debugPrintTask(void *parameter) {
   while (true) {
